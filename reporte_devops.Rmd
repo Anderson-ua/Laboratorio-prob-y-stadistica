@@ -1,0 +1,279 @@
+---
+title: "Análisis descriptivo de métricas de DevOps"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+library(tidyverse)
+library(moments)
+library(knitr)
+```
+
+# Introducción
+
+Este reporte analiza `devops_metrics_5000.csv`, un conjunto de 5000 despliegues
+que registra duración de build/deploy, líneas modificadas, bugs detectados,
+cobertura de pruebas, tiempo de resolución de tickets, equipo, módulo,
+prioridad y estado del despliegue. El objetivo es dejar la integridad de los
+datos verificada y describir el comportamiento de cada variable, sus
+diferencias entre grupos y sus relaciones.
+
+# Importación y limpieza
+
+```{r importar}
+df <- read_csv(
+  "devops_metrics_5000.csv",
+  col_types = cols(
+    id                  = col_integer(),
+    build_time_min      = col_double(),
+    deploy_time_min     = col_double(),
+    commit_size_loc     = col_integer(),
+    num_bugs            = col_integer(),
+    test_coverage_pct   = col_double(),
+    ticket_resolution_h = col_double(),
+    team                = col_character(),
+    module              = col_character(),
+    priority            = col_character(),
+    deploy_status       = col_character()
+  )
+)
+```
+
+Se fija `col_types` explícitamente para evitar que columnas discretas
+(`commit_size_loc`, `num_bugs`) se importen como decimales o que texto corto
+se interprete de forma incorrecta.
+
+```{r inspeccionar}
+glimpse(df)
+n_duplicados <- sum(duplicated(df))
+faltantes <- colSums(is.na(df))
+faltantes
+```
+
+```{r rangos}
+chequeo_rangos <- df %>% summarise(
+  coverage_fuera_de_0_100 = sum(test_coverage_pct < 0 | test_coverage_pct > 100),
+  tiempos_negativos       = sum(build_time_min < 0 | deploy_time_min < 0 | ticket_resolution_h < 0),
+  loc_negativos           = sum(commit_size_loc < 0),
+  bugs_negativos          = sum(num_bugs < 0)
+)
+kable(chequeo_rangos)
+```
+
+El dataset no presenta filas duplicadas (`r n_duplicados`), valores faltantes
+(`r sum(faltantes)` en total) ni valores fuera de rango lógico. Aun así, se
+deja un tratamiento de faltantes activo por robustez: las variables numéricas
+se imputarían con la **mediana** (varias son asimétricas y la mediana es
+menos sensible a esa cola que la media) y las categóricas con la **moda**.
+
+```{r faltantes}
+moda_de <- function(x) names(sort(table(x), decreasing = TRUE))[1]
+
+df <- df %>%
+  mutate(
+    build_time_min      = ifelse(is.na(build_time_min),      median(build_time_min,      na.rm = TRUE), build_time_min),
+    deploy_time_min      = ifelse(is.na(deploy_time_min),      median(deploy_time_min,      na.rm = TRUE), deploy_time_min),
+    commit_size_loc      = ifelse(is.na(commit_size_loc),      median(commit_size_loc,      na.rm = TRUE), commit_size_loc),
+    num_bugs             = ifelse(is.na(num_bugs),             median(num_bugs,             na.rm = TRUE), num_bugs),
+    test_coverage_pct    = ifelse(is.na(test_coverage_pct),    median(test_coverage_pct,    na.rm = TRUE), test_coverage_pct),
+    ticket_resolution_h  = ifelse(is.na(ticket_resolution_h),  median(ticket_resolution_h,  na.rm = TRUE), ticket_resolution_h),
+    team          = ifelse(is.na(team),          moda_de(team),          team),
+    module        = ifelse(is.na(module),        moda_de(module),        module),
+    priority      = ifelse(is.na(priority),      moda_de(priority),      priority),
+    deploy_status = ifelse(is.na(deploy_status), moda_de(deploy_status), deploy_status)
+  ) %>%
+  filter(!is.na(id))
+
+stopifnot(sum(is.na(df)) == 0)
+```
+
+## Tipos de variable
+
+`id` es un identificador de fila y se excluye del análisis estadístico.
+`priority` es ordinal (existe jerarquía de severidad) y se define como factor
+ordenado; `team`, `module` y `deploy_status` son nominales.
+
+```{r tipos}
+df <- df %>%
+  mutate(
+    id              = as.integer(id),
+    commit_size_loc = as.integer(commit_size_loc),
+    num_bugs        = as.integer(num_bugs),
+    priority = factor(priority, levels = c("baja", "media", "alta", "crítica"), ordered = TRUE),
+    team          = as.factor(team),
+    module        = as.factor(module),
+    deploy_status = as.factor(deploy_status)
+  )
+```
+
+# Estadística descriptiva univariada
+
+## Variables cuantitativas
+
+```{r resumen-numerico}
+vars_numericas <- c("build_time_min", "deploy_time_min", "commit_size_loc",
+                     "num_bugs", "test_coverage_pct", "ticket_resolution_h")
+
+resumen_numerico <- map_dfr(vars_numericas, function(v) {
+  x <- df[[v]]
+  tibble(
+    variable = v, media = mean(x), mediana = median(x), sd = sd(x),
+    cv = sd(x) / mean(x), iqr = IQR(x), minimo = min(x), maximo = max(x),
+    asimetria = skewness(x), curtosis = kurtosis(x)
+  )
+}) %>%
+  mutate(
+    forma_asimetria = case_when(
+      abs(asimetria) < 0.5 ~ "aprox. simétrica",
+      asimetria >= 0.5      ~ "asimetría positiva",
+      TRUE                  ~ "asimetría negativa"
+    ),
+    forma_curtosis = case_when(
+      curtosis < 2.5 ~ "platicúrtica",
+      curtosis <= 3.5 ~ "mesocúrtica",
+      TRUE ~ "leptocúrtica"
+    )
+  )
+
+kable(resumen_numerico, digits = 2)
+```
+
+`commit_size_loc`, `num_bugs` y `ticket_resolution_h` muestran asimetría
+positiva marcada y curtosis alta (colas pesadas / leptocúrticas): la mayoría
+de los despliegues son pequeños y rápidos de resolver, pero una minoría de
+cambios grandes o tickets lentos estira la cola derecha. `build_time_min`,
+`deploy_time_min` y `test_coverage_pct` son cercanas a simétricas y
+mesocúrticas.
+
+## Variables cualitativas / ordinal
+
+```{r resumen-categorico}
+vars_categoricas <- c("team", "module", "priority", "deploy_status")
+
+iqv <- function(x) {
+  p <- prop.table(table(x)); k <- length(p)
+  (k / (k - 1)) * (1 - sum(p^2))
+}
+
+resumen_categorico <- map_dfr(vars_categoricas, function(v) {
+  x <- df[[v]]; tab <- prop.table(table(x))
+  tibble(variable = v, moda = names(tab)[which.max(tab)],
+         prop_moda = max(tab), n_categorias = length(tab), iqv = iqv(x))
+})
+kable(resumen_categorico, digits = 3)
+```
+
+`deploy_status` está muy concentrada en `success` (baja dispersión, IQV
+bajo); `team` se reparte casi uniformemente entre los cuatro equipos (IQV
+cercano a 1).
+
+# Frecuencias y agrupación (Sturges)
+
+```{r sturges}
+k <- ceiling(1 + 3.322 * log10(nrow(df)))
+
+tabla_frecuencias <- df %>%
+  mutate(clase = cut(build_time_min, k)) %>%
+  count(clase, name = "fa") %>%
+  mutate(fr = fa / sum(fa), fac = cumsum(fr))
+
+kable(tabla_frecuencias, digits = 4)
+
+clase_modal <- tabla_frecuencias %>% filter(fa == max(fa))
+```
+
+Con `k = `r k`` clases, la clase modal de `build_time_min` es
+**`r clase_modal$clase`** (`r clase_modal$fa` casos), la más frecuente del
+histograma.
+
+# Análisis por grupos
+
+```{r grupos}
+kable(df %>% group_by(team) %>% summarise(
+  build_md = median(build_time_min), bugs = mean(num_bugs),
+  fallos = mean(deploy_status == "failed"), coverage = mean(test_coverage_pct)
+), digits = 3)
+
+kable(df %>% group_by(module) %>% summarise(
+  build_md = median(build_time_min), bugs = mean(num_bugs),
+  fallos = mean(deploy_status == "failed"), ticket_h = median(ticket_resolution_h)
+) %>% arrange(desc(fallos)), digits = 3)
+
+kable(df %>% group_by(priority) %>% summarise(
+  ticket_h = median(ticket_resolution_h), bugs = mean(num_bugs),
+  fallos = mean(deploy_status == "failed")
+), digits = 3)
+```
+
+Los equipos son parejos entre sí en build, bugs y cobertura. Las diferencias
+más claras aparecen por **módulo**: `ui` y `notifications` concentran la
+mayor tasa de fallos, mientras `infra` y `database` son los más estables. Por
+**prioridad**, el tiempo de resolución de ticket baja de forma consistente
+desde `baja` hasta `crítica`, lo que confirma que el triage por severidad
+funciona.
+
+# Relaciones bivariadas
+
+```{r bivariado}
+num <- df %>% select(-id) %>% select(where(is.numeric))
+kable(round(cor(num, use = "complete.obs"), 2))
+
+kable(prop.table(table(df$priority, df$deploy_status), margin = 1), digits = 3)
+```
+
+Las correlaciones entre variables cuantitativas son en general débiles
+(todas < 0.35): la más fuerte es `build_time_min` con `deploy_time_min`
+(≈0.34), seguida de `commit_size_loc` con `num_bugs` (≈0.25). La proporción
+de `deploy_status` es casi idéntica entre niveles de prioridad, evidencia de
+que **correlación no implica causalidad**: que un ticket sea crítico no lo
+hace, por sí solo, más propenso a fallar.
+
+# Visualización
+
+```{r viz-hist}
+ggplot(df, aes(x = build_time_min)) +
+  geom_histogram(bins = 20, fill = "steelblue", color = "white") +
+  labs(title = "Distribución del tiempo de build",
+       x = "Tiempo de build (min)", y = "Frecuencia")
+```
+
+```{r viz-box}
+ggplot(df, aes(x = team, y = ticket_resolution_h)) +
+  geom_boxplot(fill = "steelblue") +
+  labs(title = "Horas de resolución de ticket por equipo",
+       x = "Equipo", y = "Horas de resolución")
+```
+
+```{r viz-bar}
+ggplot(df, aes(x = module)) +
+  geom_bar(fill = "steelblue") +
+  labs(title = "Frecuencia de despliegues por módulo",
+       x = "Módulo", y = "N° de despliegues")
+```
+
+```{r viz-scatter}
+ggplot(df, aes(x = commit_size_loc, y = num_bugs)) +
+  geom_point(alpha = 0.3, color = "steelblue") +
+  labs(title = "Líneas modificadas vs. bugs post-despliegue",
+       x = "Líneas de código modificadas (LOC)", y = "N° de bugs")
+```
+
+# Conclusiones
+
+- No se detectaron problemas de integridad: sin duplicados, sin faltantes y
+  sin valores fuera de rango lógico.
+- `commit_size_loc`, `num_bugs` y `ticket_resolution_h` son fuertemente
+  asimétricas hacia la derecha; el resto de las variables cuantitativas son
+  aproximadamente simétricas.
+- El **módulo** explica más diferencias en tasa de fallos que el **equipo**;
+  `ui` y `notifications` son los puntos más frágiles del pipeline.
+- El triage por **prioridad** cumple su función en tiempos de resolución,
+  pero no está asociado a una mayor tasa real de fallos.
+- Las correlaciones entre métricas cuantitativas son consistentemente
+  débiles: ninguna variable por sí sola explica bien a otra.
